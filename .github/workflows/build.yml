@@ -1,0 +1,236 @@
+name: Build Sweet Kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      CLANG_VERSION: clang-r547379
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CLANG_TRIPLE: aarch64-linux-gnu-
+
+    steps:
+
+      - name: Checkout kernel (KernelSU-Next submodule dahil)
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential flex git libelf-dev libssl-dev \
+            lz4 python3 rsync unzip wget zip curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Download Android Clang
+        run: |
+          set -e
+          mkdir -p "$HOME/toolchains/$CLANG_VERSION"
+          cd "$HOME/toolchains/$CLANG_VERSION"
+
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          if curl -fL --retry 3 "$URL" | tar xz; then
+            echo "Clang tarball indirildi."
+          else
+            echo "Tarball basarisiz, git clone ile deneniyor..."
+            cd "$HOME/toolchains"
+            rm -rf "$CLANG_VERSION" clang-full
+            git clone --depth=1 \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              clang-full
+            mv "clang-full/$CLANG_VERSION" "$HOME/toolchains/$CLANG_VERSION"
+          fi
+
+          CLANG_DIR="$HOME/toolchains/$CLANG_VERSION/bin"
+          [ -x "$CLANG_DIR/clang" ] || { echo "ERROR: clang bulunamadi"; exit 1; }
+
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "$CLANG_DIR" >> "$GITHUB_PATH"
+          "$CLANG_DIR/clang" --version | head -1
+
+      - name: Show kernel and KernelSU-Next
+        run: |
+          set -e
+          make kernelversion
+          git log -1 --oneline
+          ls KernelSU-Next | head -5 || echo "UYARI: KernelSU-Next bos"
+          ls -la drivers/kernelsu || true
+
+      - name: Drop unrelated DTB targets
+        run: |
+          set -e
+
+          MK=arch/arm64/boot/dts/qcom/Makefile
+          cp "$MK" /tmp/Makefile.orig
+
+          grep -q 'sweet' "$MK" || { echo "ERROR: sweet hedefi yok"; exit 1; }
+
+          PAT='(sa6155|sa8155|sa8195|qcs610|qcs410)'
+
+          sed -i -E "/^[[:space:]]*[A-Za-z0-9_-]*${PAT}[A-Za-z0-9_-]*\.dtbo?-base/d" "$MK"
+          sed -i -E "s/[A-Za-z0-9_-]*${PAT}[A-Za-z0-9_-]*\.dtbo?//g" "$MK"
+
+          echo "=== Degisiklik ozeti ==="
+          diff -u /tmp/Makefile.orig "$MK" | head -60 || true
+          echo "=== Sweet hedefleri ==="
+          grep -n 'sweet' "$MK"
+
+      - name: Detect Sweet defconfig
+        run: |
+          set -e
+          DEFCONFIG=""
+          for candidate in \
+            vendor/sdmsteppe-perf_defconfig \
+            vendor/sdmsteppe_defconfig \
+            vendor/sweet_defconfig \
+            sweet_defconfig
+          do
+            if [ -f "arch/arm64/configs/$candidate" ]; then
+              DEFCONFIG="$candidate"
+              break
+            fi
+          done
+          [ -n "$DEFCONFIG" ] || { echo "ERROR: defconfig yok"; exit 1; }
+          echo "Selected: $DEFCONFIG"
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+
+      - name: Prepare configuration (balanced pil ayarlari)
+        run: |
+          set -e
+          rm -rf out
+          mkdir -p out
+
+          MAKE_ARGS=(
+            O="$PWD/out"
+            ARCH=arm64
+            CROSS_COMPILE="$CROSS_COMPILE"
+            CLANG_TRIPLE="$CLANG_TRIPLE"
+            CC=clang
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Balanced pil:
+          #  - HZ 300 -> 250: daha az timer uyanmasi
+          #  - schedutil acik varsayilan governor
+          #  - SCHEDSTATS kapali: scheduler istatistik yuku yok
+          #  - Debug/event log kapali: daha kucuk ve hizli kernel
+          scripts/config --file out/.config \
+            -d HZ_300 -e HZ_250 \
+            -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
+            -d SCHEDSTATS \
+            -d DEBUG_INFO \
+            -d DRM_SDE_EVTLOG_DEBUG \
+            -d MSM_SDE_ROTATOR_EVTLOG_DEBUG \
+            -d DRM_MSM_REGISTER_LOGGING \
+            -d VIDEO_ADV_DEBUG
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "=== Uygulanan ayarlar ==="
+          grep -E '^(# )?CONFIG_(HZ_250|HZ_300|HZ|SCHEDSTATS|DEBUG_INFO|CPU_FREQ_DEFAULT_GOV_SCHEDUTIL|WQ_POWER_EFFICIENT_DEFAULT|DEFAULT_USE_ENERGY_AWARE)[ =]' out/.config || true
+
+          echo "=== KernelSU ==="
+          grep -E '^CONFIG_KSU' out/.config || echo "UYARI: CONFIG_KSU satiri yok"
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          BUILD_LOG="$GITHUB_WORKSPACE/build.log"
+
+          set +e
+          make \
+            -j"$(nproc)" \
+            O="$PWD/out" \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            Image.gz-dtb \
+            2>&1 | tee "$BUILD_LOG"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          echo "BUILD EXIT CODE: $STATUS"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "=========== FIRST ERRORS ==========="
+            grep -n -m 20 -E 'error:|fatal error:|FATAL ERROR|Error [0-9]+|undefined reference|No such file|Label or path|Syntax error' "$BUILD_LOG" || true
+            echo "=========== LAST 100 LINES ==========="
+            tail -100 "$BUILD_LOG"
+            exit "$STATUS"
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          set -e
+
+          IMAGE="out/arch/arm64/boot/Image.gz-dtb"
+          [ -f "$IMAGE" ] || { echo "ERROR: Image.gz-dtb yok"; exit 1; }
+          ls -lh "$IMAGE"
+          sha256sum "$IMAGE" | tee kernel.sha256
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          rm -rf anykernel/.git anykernel/.github
+          cp "$IMAGE" anykernel/Image.gz-dtb
+
+          cat > anykernel/anykernel.sh <<'AKEOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=BAHADIR SWEET Balanced Kernel (KSU-Next)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=sweet
+          device.name2=sweetin
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          AKEOF
+
+          cd anykernel
+          zip -r9 ../BAHADIR-SWEET-KERNEL.zip . -x "*.git*"
+          cd ..
+          unzip -l BAHADIR-SWEET-KERNEL.zip | head -20
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: BAHADIR-SWEET-KERNEL
+          path: |
+            BAHADIR-SWEET-KERNEL.zip
+            kernel.sha256
+            build.log
+            out/.config
+          if-no-files-found: warn
